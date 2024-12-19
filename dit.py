@@ -61,9 +61,10 @@ def get_2d_sincos_pos_embed(rng, embed_dim, length):
 
 
 class PatchEmbed():
-    def __init__(self, in_channels=4, dim=1024, patch_size: int = 2):
+    def __init__(self, in_channels=4, img_size: int=32, dim=1024, patch_size: int = 2):
         self.dim = dim
         self.patch_size = patch_size
+        self.num_patches = (img_size // self.patch_size) ** 2
         self.conv_project = nnx.Conv(
             in_channels,
             dim,
@@ -109,13 +110,57 @@ class DiTBlock(nnx.Module):
 
     def __call__(self, x_img: Array, cond: Array):
         cond = self.adaln(nnx.silu(cond))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.array_split(cond, 6, axis=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.array_split(cond, 6, axis=-1)
 
         attn_x = self.attention(modulate(self.norm_1(x_img), shift_msa, scale_msa))
         x = x_img + (jnp.expand_dims(gate_msa, 1) * attn_x)
-        
+
         x = modulate(self.norm_2(x), shift_mlp, scale_mlp)
         mlp_x = self.mlp_block(x)
         x = x + (jnp.expand_dims(gate_mlp, 1) * mlp_x)
 
+        return x
+
+
+class FinalMLP(nnx.Module):
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+
+        self.norm_final = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
+        self.linear = nnx.Linear(
+            hidden_size,
+            patch_size[0] * patch_size[1] * out_channels,
+            rngs=rngs,
+            kernel_init=nnx.initializers.xavier_uniform(),
+            bias_init=zero_init,
+        )
+
+        self.adaln_linear = nnx.Linear(
+            hidden_size,
+            2 * hidden_size,
+            rngs=rngs,
+            kernel_init=nnx.initializers.xavier_uniform(),
+            bias_init=zero_init
+        )
+
+    def __call__(self, x_input: Array, cond: Array):
+        linear_cond = nnx.silu(self.adaln_linear(cond))
+        shift, scale = jnp.array_split(linear_cond, 2, axis=-1)
+
+        x = modulate(self.norm_final(x_input), shift, scale)
+        x = self.linear(x)
+
+        return x
+
+
+class DiT(nnx.Module):
+    def __init__(self, dim: int = 1024, patch_size: tuple = (2, 2), depth: int = 12, attn_heads=16):
+        super().__init__()
+        self.dim = dim
+        self.patch_embed = PatchEmbed(dim=dim, patch_size=patch_size[0])
+        self.label_embedder = None
+        
+    
+    def __call__(self, x: Array):
+        
         return x
