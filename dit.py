@@ -1,16 +1,21 @@
 import jax, math
-from jax import Array, numpy as jnp
+from jax import Array, numpy as jnp, random as jrand
 from flax import nnx
 from einops import rearrange
 
-rngs = nnx.Rngs(333)
+class config:
+    seed = 333
+    
+rngs = nnx.Rngs(config.seed)
+randkey = jrand.key(config.seed)
+
 xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0.0)
+normal_init = nnx.initializers.normal(0.02)
 
-
+## helpers/util functions
 def modulate(x, shift, scale):
     return x * (1 + scale[:, None]) + shift[:, None]
-
 
 # From https://github.com/young-geng/m3ae_public/blob/master/m3ae/model.py
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -80,6 +85,81 @@ class PatchEmbed():
         num_patches = (H // self.patch_size[0])
         x = self.conv_project(x) # (B, P, P, hidden_size)
         x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches, w=num_patches)
+        return x
+
+
+class TimestepEmbedder(nnx.Module):
+    def __init__(self, hidden_size, freq_embed_size=256):
+        super().__init__()
+        self.lin_1 = nnx.Linear(freq_embed_size, hidden_size, rngs=rngs)
+        self.lin_2 = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
+        self.freq_embed_size = freq_embed_size
+
+    @staticmethod
+    def timestep_embedding(time_array: Array, dim, max_period=10000):
+        half = dim // 2
+        freqs = jnp.exp(-math.log(max_period) * jnp.arange(0, half) / half)
+
+        args = jnp.float_(time_array[:, None]) * freqs[None]
+
+        embedding = jnp.concat([jnp.cos(args), jnp.sin(args)], axis=-1)
+        if dim % 2:
+            embedding = jnp.concat(
+                [embedding, jnp.zeros_like(embedding[:, :1])], axis=-1
+            )
+
+        return embedding
+
+    def __call__(self, x: Array) -> Array:
+        t_freq = self.timestep_embedding(x, self.freq_embed_size)
+        t_embed = nnx.silu(self.lin_1(t_freq))
+
+        return self.lin_2(t_embed)
+
+
+class LabelEmbedder(nnx.Module):
+    def __init__(self, num_classes, hidden_size, drop):
+        super().__init__()
+        use_cfg_embeddings = drop > 0
+        self.embedding_table = nnx.Embed(
+            num_classes + int(use_cfg_embeddings),
+            hidden_size,
+            rngs=rngs,
+            embedding_init=nnx.initializers.normal(0.02),
+        )
+        self.num_classes = num_classes
+        self.dropout = drop
+
+    def token_drop(self, labels, force_drop_ids=None) -> Array:
+        if force_drop_ids is None:
+            drop_ids = jrand.normal(key=randkey, shape=labels.shape[0])
+        else:
+            drop_ids = force_drop_ids == 1
+
+        labels = jnp.where(drop_ids, self.num_classes, labels)
+
+        return labels
+
+    def __call__(self, labels, train: bool, force_drop_ids=None) -> Array:
+        use_drop = self.dropout > 0
+        if (train and use_drop) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+
+        label_embeds = self.embedding_table(labels)
+
+        return label_embeds
+
+
+class CaptionEmbedder(nnx.Module):
+    def __init__(self, cap_embed_dim, embed_dim):
+        super().__init__()
+        self.linear_1 = nnx.Linear(cap_embed_dim, embed_dim, rngs=rngs)
+        self.linear_2 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
+
+    def __call__(self, x: Array) -> Array:
+        x = nnx.silu(self.linear_1(x))
+        x = self.linear_2(x)
+
         return x
 
 
