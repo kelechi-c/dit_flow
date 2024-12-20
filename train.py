@@ -1,10 +1,11 @@
-import jax, optax, wandb, torch, os
+import jax, optax, wandb, torch, os, click
 import numpy as np
 from flax import nnx
 from jax import Array, numpy as jnp, random as jrand
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 from tqdm import tqdm
+from time import time
 from einops import rearrange
 from diffusers import AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
@@ -15,6 +16,7 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
 from dit import config, randkey
+from flow import flow_lossfn
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -29,7 +31,7 @@ JAX_DEFAULT_MATMUL_PRECISION = "bfloat16"
 num_devices = jax.device_count()
 devices = jax.devices()
 
-print(f"found {num_devices} JAX devices")
+print(f"found {num_devices} JAX device(s)")
 for device in devices:
     print(f"{device} / ")
 
@@ -178,21 +180,93 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
 
 @nnx.jit
 def train_step(model, optimizer, batch):
-    def loss_func(model, batch):
-        img_latents, label = batch["vae_output"], batch["label"]
+    def flow_lossfn(model, batch):
+        img_latents, labels = batch["vae_output"], batch["label"]
 
         img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
         img_latents = rearrange(img_latents, "b c h w -> b h w c")
-        # print(f"latents => {img_latents.shape}")
+        print(f"latents => {img_latents.shape}")
 
-        img_latents, label = jax.device_put((img_latents, label))
+        img_latents, labels = jax.device_put((img_latents, labels))
 
-        loss = model(img_latents, label)
+        x_1, c = img_latents, labels
+
+        x_0 = jrand.normal(randkey, x_1.shape)
+        t = jrand.normal(randkey, len(x_1))
+
+        x_t = (1-t) * x_0 + t * x_1
+        dx_t = x_1 - x_0 # actual vector/velocity difference 
+
+        vtheta = model(x_t, t, c) # model prediction
+
+        mean_dim = list(range(1, len(x_1.shape)))  # across all dimensions except the batch dim
+        mean_square = (dx_t - vtheta) ** 2  # squared difference/error
+        batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
+        loss = jnp.mean(batchwise_mse_loss)
 
         return loss
 
-    gradfn = nnx.value_and_grad(loss_func)
+    gradfn = nnx.value_and_grad(flow_lossfn)
     loss, grads = gradfn(model, batch)
     optimizer.update(grads)
 
     return loss
+
+
+def overfit(epochs, model, optimizer, train_loader=train_loader):
+    train_loss = 0.0
+    model.train()
+
+    wandb_logger(
+        key="", project_name="microdit_overfit"
+    )
+
+    stime = time.time()
+
+    batch = next(iter(train_loader))
+    print("start overfitting.../")
+    for epoch in tqdm(range(epochs)):
+        train_loss = train_step(model, optimizer, batch)
+        print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
+        wandb.log(
+            {"loss": train_loss.item(), "log_loss": math.log10(train_loss.item())}
+        )
+
+        if epoch % 25 == 0:
+            gridfile = sample_image_batch(epoch, model)
+            image_log = wandb.Image(gridfile)
+            wandb.log({"image_sample": image_log})
+
+        jax.clear_caches()
+        # jax.clear_backends()
+        gc.collect()
+
+    etime = time.time() - stime
+    print(
+        f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
+    )
+
+    epoch_file = sample_image_batch("overfit", model)
+    epoch_image_log = wandb.Image(epoch_file)
+    wandb.log({"epoch_sample": epoch_image_log})
+
+    return model, train_loss
+
+
+@click.command()
+@click.option("-r", "--run", default="overfit")
+@click.option("-e", "--epochs", default=10)
+def main(run, epochs):
+    if run == "overfit":
+        model, loss = overfit(epochs)
+        wandb.finish()
+        print(f"microdit overfitting ended at loss {loss:.4f}")
+
+    elif run == "train":
+        print(f'you missed your train looop impl boy')
+        # trainer(epochs)
+        # wandb.finish()
+        # print("microdit (test) training (on imagenet-1k) in JAX..done")
+
+
+main()
