@@ -5,6 +5,16 @@ from einops import rearrange
 
 class config:
     seed = 333
+    batch_size = 128
+    img_size = 32
+    patch_size = (2, 2)
+    lr = 2e-4
+    cfg_scale = 2.0
+    vaescale_factor = 0.13025
+    data_id = "cloneofsimo/imagenet.int8"
+    vae_id = "madebyollin/sdxl-vae-fp16-fix"
+    imagenet_id = "ILSVRC/imagenet-1k"
+
     
 rngs = nnx.Rngs(config.seed)
 randkey = jrand.key(config.seed)
@@ -43,7 +53,7 @@ def get_1d_sincos_pos_embed(embed_dim, length):
     )
 
 
-def get_2d_sincos_pos_embed(rng, embed_dim, length):
+def get_2d_sincos_pos_embed(embed_dim, length):
     # example: embed_dim = 256, length = 16*16
     grid_size = int(length**0.5)
     assert grid_size * grid_size == length
@@ -69,22 +79,23 @@ class PatchEmbed():
     def __init__(self, in_channels=4, img_size: int=32, dim=1024, patch_size: int = 2):
         self.dim = dim
         self.patch_size = patch_size
+        patch_tuple = (patch_size, patch_size)
         self.num_patches = (img_size // self.patch_size) ** 2
         self.conv_project = nnx.Conv(
             in_channels,
             dim,
-            kernel_size=patch_size,
-            strides=patch_size,
+            kernel_size=patch_tuple,
+            strides=patch_tuple,
             use_bias=False,
             padding="VALID",
-            kernel_init=xavier_init,
+            kernel_init=xavier_init
         )
 
     def __call__(self, x):
         B, H, W, C = x.shape
-        num_patches = (H // self.patch_size[0])
+        num_patches_side = (H // self.patch_size)
         x = self.conv_project(x) # (B, P, P, hidden_size)
-        x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches, w=num_patches)
+        x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches_side, w=num_patches_side)
         return x
 
 
@@ -234,13 +245,50 @@ class FinalMLP(nnx.Module):
 
 
 class DiT(nnx.Module):
-    def __init__(self, dim: int = 1024, patch_size: tuple = (2, 2), depth: int = 12, attn_heads=16):
+    def __init__(self, in_channels: int=4, dim: int = 1024, patch_size: tuple = (2, 2), depth: int = 12, attn_heads=16, drop=0.0):
         super().__init__()
         self.dim = dim
+        self.out_channels = in_channels
         self.patch_embed = PatchEmbed(dim=dim, patch_size=patch_size[0])
-        self.label_embedder = None
-        
+        self.num_patches = self.patch_embed.num_patches 
+        self.label_embedder = LabelEmbedder(1000, dim, drop=drop)
+        self.time_embed = TimestepEmbedder(dim)
+        self.dit_layers = [DiTBlock(dim, attn_heads, drop=drop) for _ in range(depth)]
+        self.final_layer = FinalMLP(dim, patch_size, self.out_channels)
     
-    def __call__(self, x: Array):
+    def _unpatchify(self, x, patch_size=(2, 2), height=32, width=32):
+        
+        bs, num_patches, patch_dim = x.shape
+        H, W = patch_size
+        in_channels = patch_dim // (H * W)
+        # Calculate the number of patches along each dimension
+        num_patches_h, num_patches_w = height // H, width // W
+
+        # Reshape x to (bs, num_patches_h, num_patches_w, H, W, in_channels)
+        x = x.view(bs, num_patches_h, num_patches_w, H, W, in_channels)
+
+        # Permute x to (bs, num_patches_h, H, num_patches_w, W, in_channels)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+
+        # Reshape x to (bs, height, width, in_channels)
+        reconstructed = x.view(bs, height, width, in_channels)
+        
+        return reconstructed
+
+    def __call__(self, x: Array, label: Array, t: Array):
+        b, h, w, c = x.shape
+        pos_embed = get_2d_sincos_pos_embed(rng=rngs, embed_dim=self.dim, length=self.num_patches**2)
+        
+        x = self.patch_embed(x)
+        x = x + pos_embed
+        t = self.time_embed(t)
+        y = self.label_embedder(label)
+        
+        cond = t + y
+        for layer in self.dit_layers:
+            x = layer(x, cond)
+            
+        x = self.final_layer(x)
+        x = self._unpatchify(x)
         
         return x
