@@ -25,31 +25,28 @@ def flow_lossfn(model, batch):
     return loss
 
 
-def flow_step(model, x_t: Array, t_start: Array, t_end: Array) -> Array:
-    t_start = t_start.view(1, 1).expand(x_t.shape[0], 1)
+def flow_step(model, x_t: Array, cond: Array, t_start: Array, t_end: Array) -> Array:
+    t_start = jnp.broadcast_to(t_start.reshape(1, 1), (x_t.shape[0], 1))
 
-    return (
-        x_t + (t_end - t_start)
-        * model(
-            t=t_start + (t_end - t_start) / 2,
-            x_t=x_t + model(x_t=x_t, t=t_start) * (t_end - t_start) / 2,
-        )
+    return x_t + (t_end - t_start) * model(
+        t=t_start + (t_end - t_start) / 2,
+        x_t=x_t + model(x_t=x_t, cond=cond, t=t_start) * (t_end - t_start) / 2,
+        cond=cond
     )
 
 
-def sample(model, z_noise, cond, num_steps=50):
-    dt = 1.0 / num_steps
-    bs = z_noise.shape[0]
-    
-    t = jnp.zeros(randkey, (bs,))
+def sample(model, x_t: Array, cond: Array, num_steps: int = 50):
+    # t = jnp.zeros(randkey, (bs,))
     time_steps = jnp.linspace(0, 1.0, num_steps + 1)
 
     for k in tqdm(range(num_steps)):
-        pass
-    # def step_fn(x, i):
-    #     t = jnp.full((bs,), i * dt)
-    #     x = x + dt * model(x, cond, t)
-    #     return x, None
+        x_t = flow_step(
+            model,
+            x_t = x_t,
+            cond=cond, 
+            t_start = time_steps[k], 
+            t_end = time_steps[k + 1]
+        )
 
+    return x_t
     # x, _ = jax.lax.scan(step_fn, x, jnp.arange(num_steps))
-    return x
