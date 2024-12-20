@@ -82,7 +82,7 @@ def device_get_model(model):
 
 
 def sample_image_batch(step, model, labels):
-    # classin = jnp.array(
+    # labels = jnp.array(
     #     [76, 292, 293, 979, 968, 967, 33, 88, 404]
     # )  # 76, 292, 293, 979, 968 imagenet
     randnoise = jrand.uniform(randkey, (len(labels), 32, 32, 4))
@@ -97,26 +97,6 @@ def sample_image_batch(step, model, labels):
     del pred_model
 
     return gridfile
-
-
-def sample_image_batch(model, step, labels):
-    pred_model = model  # .eval()
-    with torch.no_grad():
-        cond = labels % 10
-        uncond = torch.ones_like(cond) * 10
-
-        init_noise = torch.randn(len(cond), 4, 32, 32).cuda()
-        image_batch = pred_model.sample(init_noise, cond, uncond)
-
-        imgfile = f"samples/sample_{step}.png"
-        batch = [process_img(x) for x in image_batch]
-        gridfile = image_grid(batch, imgfile)
-        print(f"sample saved @ {imgfile}")
-        del pred_model
-
-        return gridfile
-
-    model.train()
 
 
 def vae_decode(latent, vae=vae):
