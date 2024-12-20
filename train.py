@@ -1,4 +1,4 @@
-import jax, optax, wandb, torch, os, click
+import jax, optax, wandb, torch, os, click, math, gc
 import numpy as np
 from flax import nnx
 from jax import Array, numpy as jnp, random as jrand
@@ -15,8 +15,7 @@ from typing import Any
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
-from dit import config, randkey
-from flow import flow_lossfn
+from dit import config, randkey, DiT
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -63,23 +62,6 @@ _encodings["uint8"] = uint8
 remote_train_dir = "./vae_mds"  # this is the path you installed this dataset.
 local_train_dir = "./imagenet"  # just a local mirror path
 
-dataset = StreamingDataset(
-    local=local_train_dir,
-    remote=remote_train_dir,
-    split=None,
-    shuffle=True,
-    shuffle_algo="naive",
-    batch_size=config.batch_size,
-)
-
-train_loader = DataLoader(
-    dataset[: config.data_split],
-    batch_size=16,  # config.batch_size,
-    num_workers=0,
-    drop_last=True,
-    collate_fn=jax_collate,
-    # sampler=dataset_sampler, # thi sis for multiprocess/v4-32
-)
 
 def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
     # initilaize wandb
@@ -180,7 +162,7 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
 
 @nnx.jit
 def train_step(model, optimizer, batch):
-    def flow_lossfn(model, batch):
+    def flow_lossfn(model, batch):# loss function for flow matching
         img_latents, labels = batch["vae_output"], batch["label"]
 
         img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
@@ -189,15 +171,15 @@ def train_step(model, optimizer, batch):
 
         img_latents, labels = jax.device_put((img_latents, labels))
 
-        x_1, c = img_latents, labels
+        x_1, c = img_latents, labels # reassign to more concise variables
 
-        x_0 = jrand.normal(randkey, x_1.shape)
-        t = jrand.normal(randkey, len(x_1))
+        x_0 = jrand.normal(randkey, x_1.shape) # noise
+        t = jrand.normal(randkey, len(x_1)) # t/time cond
 
         x_t = (1-t) * x_0 + t * x_1
-        dx_t = x_1 - x_0 # actual vector/velocity difference 
+        dx_t = x_1 - x_0 # actual vector/velocity difference
 
-        vtheta = model(x_t, t, c) # model prediction
+        vtheta = model(x_t, t, c) # model vector prediction
 
         mean_dim = list(range(1, len(x_1.shape)))  # across all dimensions except the batch dim
         mean_square = (dx_t - vtheta) ** 2  # squared difference/error
@@ -206,25 +188,25 @@ def train_step(model, optimizer, batch):
 
         return loss
 
-    gradfn = nnx.value_and_grad(flow_lossfn)
-    loss, grads = gradfn(model, batch)
+    loss, grads = nnx.value_and_grad(flow_lossfn)(model, batch)
     optimizer.update(grads)
 
     return loss
 
 
-def overfit(epochs, model, optimizer, train_loader=train_loader):
+def batch_trainer(epochs, model, optimizer, train_loader):
     train_loss = 0.0
     model.train()
 
     wandb_logger(
-        key="", project_name="microdit_overfit"
+        key="", project_name="dit_jax"
     )
 
     stime = time.time()
 
     batch = next(iter(train_loader))
     print("start overfitting.../")
+    
     for epoch in tqdm(range(epochs)):
         train_loss = train_step(model, optimizer, batch)
         print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
@@ -232,13 +214,8 @@ def overfit(epochs, model, optimizer, train_loader=train_loader):
             {"loss": train_loss.item(), "log_loss": math.log10(train_loss.item())}
         )
 
-        if epoch % 25 == 0:
-            gridfile = sample_image_batch(epoch, model)
-            image_log = wandb.Image(gridfile)
-            wandb.log({"image_sample": image_log})
-
         jax.clear_caches()
-        # jax.clear_backends()
+        jax.clear_backends()
         gc.collect()
 
     etime = time.time() - stime
@@ -256,11 +233,44 @@ def overfit(epochs, model, optimizer, train_loader=train_loader):
 @click.command()
 @click.option("-r", "--run", default="overfit")
 @click.option("-e", "--epochs", default=10)
-def main(run, epochs):
+@click.option("-bs", "--batch_size", default=32)
+def main(run, epochs, batch_size):
+    
+    # DiT-B config
+    dit_model = DiT(
+        dim=1024, 
+        depth=16,
+        attn_heads=16
+    )
+    
+    n_params = sum([p.size for p in jax.tree.leaves(nnx.state(dit_model))])
+    print(f"model parameters count: {n_params/1e6:.2f}M, ")
+
+    optimizer = nnx.Optimizer(dit_model, optax.adamw(learning_rate=config.lr))
+
+    
+    dataset = StreamingDataset(
+        local=local_train_dir,
+        remote=remote_train_dir,
+        split=None,
+        shuffle=True,
+        shuffle_algo="naive",
+        batch_size=config.batch_size,
+    )
+
+    train_loader = DataLoader(
+        dataset[: config.data_split],
+        batch_size=batch_size,  # config.batch_size,
+        num_workers=0,
+        drop_last=True,
+        collate_fn=jax_collate,
+        # sampler=dataset_sampler, # thi sis for multiprocess/v4-32
+    )
+
     if run == "overfit":
-        model, loss = overfit(epochs)
+        model, loss = batch_trainer(epochs, model=dit_model, optimizer=optimizer, train_loader=train_loader)
         wandb.finish()
-        print(f"microdit overfitting ended at loss {loss:.4f}")
+        print(f"single batch training ended at loss: {loss:.4f}")
 
     elif run == "train":
         print(f'you missed your train looop impl boy')
