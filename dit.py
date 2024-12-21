@@ -2,6 +2,7 @@ import jax, math
 from jax import Array, numpy as jnp, random as jrand
 from flax import nnx
 from einops import rearrange
+from tqdm import tqdm
 
 class config:
     seed = 333
@@ -15,7 +16,7 @@ class config:
     vae_id = "madebyollin/sdxl-vae-fp16-fix"
     imagenet_id = "ILSVRC/imagenet-1k"
 
-    
+
 rngs = nnx.Rngs(config.seed)
 randkey = jrand.key(config.seed)
 
@@ -255,9 +256,9 @@ class DiT(nnx.Module):
         self.time_embed = TimestepEmbedder(dim)
         self.dit_layers = [DiTBlock(dim, attn_heads, drop=drop) for _ in range(depth)]
         self.final_layer = FinalMLP(dim, patch_size, self.out_channels)
-    
+
     def _unpatchify(self, x, patch_size=(2, 2), height=32, width=32):
-        
+
         bs, num_patches, patch_dim = x.shape
         H, W = patch_size
         in_channels = patch_dim // (H * W)
@@ -272,23 +273,43 @@ class DiT(nnx.Module):
 
         # Reshape x to (bs, height, width, in_channels)
         reconstructed = x.view(bs, height, width, in_channels)
-        
+
         return reconstructed
 
-    def __call__(self, x: Array, label: Array, t: Array):
-        b, h, w, c = x.shape
+    def __call__(self, x_t: Array, label: Array, t: Array):
+
         pos_embed = get_2d_sincos_pos_embed(rng=rngs, embed_dim=self.dim, length=self.num_patches**2)
-        
-        x = self.patch_embed(x)
+
+        x = self.patch_embed(x_t)
         x = x + pos_embed
         t = self.time_embed(t)
         y = self.label_embedder(label)
-        
+
         cond = t + y
         for layer in self.dit_layers:
             x = layer(x, cond)
-            
+
         x = self.final_layer(x)
         x = self._unpatchify(x)
-        
+
         return x
+
+    def flow_step(self, x_t: Array, cond: Array, t_start: Array, t_end: Array) -> Array:
+        t_start = jnp.broadcast_to(t_start.reshape(1, 1), (x_t.shape[0], 1))
+
+        return x_t + (t_end - t_start) * self(
+            t=t_start + (t_end - t_start) / 2,
+            x_t=x_t + self(x_t=x_t, cond=cond, t=t_start) * (t_end - t_start) / 2,
+            cond=cond,
+        )
+
+    def sample(self, x_t: Array, label: Array, num_steps: int = 50):
+        # t = jnp.zeros(randkey, (bs,))
+        time_steps = jnp.linspace(0, 1.0, num_steps + 1)
+
+        for k in tqdm(range(num_steps), desc='smapling images(hopefully...)'):
+            x_t = self.flow_step(
+                x_t=x_t, cond=label, t_start=time_steps[k], t_end=time_steps[k + 1]
+            )
+
+        return x_t
