@@ -2,8 +2,12 @@ import jax, optax, wandb, torch, os, click, math, gc, time
 import numpy as np
 from flax import nnx
 from jax import Array, numpy as jnp, random as jrand
+from jax.sharding import NamedSharding, Mesh, PartitionSpec as PS
+from jax.experimental import mesh_utils
+from jax import random as jrand
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
+import streaming
 from tqdm import tqdm
 from einops import rearrange
 from diffusers import AutoencoderKL
@@ -45,18 +49,8 @@ print(f"found {num_devices} JAX device(s)")
 for device in devices:
     print(f"{device} / ")
 
-from jax.sharding import NamedSharding, Mesh, PartitionSpec as PS
-from jax.experimental import mesh_utils
-from jax import random as jrand
-
-device_count = jax.device_count()  # 8 devices for tpuv2-8
-devices = jax.devices()
-
-# randtensor = jrand.normal(jrand.key(33), (32, 64, 1024))
-
-mesh_devices = mesh_utils.create_device_mesh((device_count,))
+mesh_devices = mesh_utils.create_device_mesh((num_devices,))
 mesh = Mesh(mesh_devices, axis_names="axis")
-
 sharding = NamedSharding(mesh, PS("axis"))
 
 # sd VAE for decoding latents
@@ -122,8 +116,7 @@ def get_1d_sincos_pos_embed(embed_dim, length):
     return jnp.expand_dims(
         get_1d_sincos_pos_embed_from_grid(
             embed_dim, jnp.arange(length, dtype=jnp.float32)
-        ),
-        0,
+        ), axis=0
     )
 
 
@@ -357,7 +350,6 @@ class DiT(nnx.Module):
         self.final_layer = FinalMLP(dim, patch_size, self.out_channels)
 
     def _unpatchify(self, x, patch_size=(2, 2), height=32, width=32):
-
         bs, num_patches, patch_dim = x.shape
         H, W = patch_size
         in_channels = patch_dim // (H * W)
@@ -376,9 +368,6 @@ class DiT(nnx.Module):
         return reconstructed
 
     def __call__(self, x_t: Array, cond: Array, t: Array):
-        # t = jnp.broadcast_to(t, x_t.shape[:1])[:, None, None, None]
-        # print(f'model call t shape: {t.shape}')
-
         pos_embed = get_2d_sincos_pos_embed(embed_dim=self.dim, length=self.num_patches)
 
         x = self.patch_embed(x_t)
@@ -387,7 +376,6 @@ class DiT(nnx.Module):
         y = self.label_embedder(cond)
 
         cond = t + y
-        # print(f'{cond.shape = }')
 
         for layer in self.dit_layers:
             x = layer(x, cond)
@@ -420,7 +408,7 @@ class DiT(nnx.Module):
         return x_t / config.vaescale_factor
 
 
-def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
+def wandb_logger(key: str, project_name, run_name=None):
     # initilaize wandb
     wandb.login(key=key)
     wandb.init(
@@ -439,10 +427,6 @@ def device_get_model(model):
 
 
 def sample_image_batch(step, model, labels):
-    # labels = jnp.array(
-    #     [76, 292, 293, 979, 968, 967, 33, 88, 404]
-    # )  # 76, 292, 293, 979, 968 imagenet
-    # randnoise = jrand.uniform(randkey, (len(labels), 32, 32, 4))
     pred_model = device_get_model(model)
     pred_model.eval()
     image_batch = pred_model.sample(labels)
@@ -457,7 +441,6 @@ def sample_image_batch(step, model, labels):
 
 
 def vae_decode(latent, vae=vae):
-    # print(f'decoding... (latent shape = {latent.shape}) ')
     tensor_img = rearrange(latent, "b h w c -> b c h w")
     tensor_img = torch.from_numpy(np.array(tensor_img))
     x = vae.decode(tensor_img).sample
@@ -503,8 +486,7 @@ def train_step(model, optimizer, batch):
         img_latents, labels = batch["vae_output"], batch["label"]
 
         img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
-        img_latents = rearrange(img_latents, "b c h w -> b h w c")
-        # print(f"latents => {img_latents.shape}")
+        img_latents = rearrange(img_latents, "b c h w -> b h w c") # jax uses channels-last format
 
         img_latents, labels = jax.device_put((img_latents, labels), jax.devices()[0])
 
@@ -512,7 +494,6 @@ def train_step(model, optimizer, batch):
         bs = x_1.shape[0]
 
         x_0 = jrand.normal(randkey, x_1.shape)  # noise
-        # t = jrand.normal(randkey, (len(x_1), 1, 1, 1))  # t/time cond
         t = jrand.uniform(randkey, (bs,))
         t = nnx.sigmoid(t)
 
@@ -522,14 +503,10 @@ def train_step(model, optimizer, batch):
 
         x_t = (1 - t_exp) * x_0 + t_exp * x_1
         dx_t = x_1 - x_0  # actual vector/velocity difference
-        # print(f'{x_1.shape = } / {c.shape = } / {t.shape = } / {x_t.shape = } / {dx_t.shape = }')
 
         vtheta = model(x_t, c, t)  # model vector prediction
-        # print(f'{vtheta.shape = }')
 
-        mean_dim = list(
-            range(1, len(x_1.shape))
-        )  # across all dimensions except the batch dim
+        mean_dim = list(range(1, len(x_1.shape)))  # across all dimensions except the batch dim
         mean_square = (dx_t - vtheta) ** 2  # squared difference/error
         batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
         loss = jnp.mean(batchwise_mse_loss)
@@ -579,15 +556,11 @@ def batch_trainer(epochs, model, optimizer, train_loader):
     return model, train_loss
 
 
-# sharded_batch = jax.device_put(randtensor, sharding)
-
-
 @click.command()
-@click.option("-r", "--run", default="overfit")
-@click.option("-e", "--epochs", default=10)
-@click.option("-bs", "--batch_size", default=9)
+@click.option("-r", "--run", default="single_batch")
+@click.option("-e", "--epochs", default=config.epochs)
+@click.option("-bs", "--batch_size", default=config.batch_size)
 def main(run, epochs, batch_size):
-
     # DiT-B config
     dit_model = DiT(dim=1024, depth=24, attn_heads=16)
 
@@ -599,44 +572,32 @@ def main(run, epochs, batch_size):
     state = nnx.state((dit_model, optimizer))
     state = jax.device_put(state, jax.devices()[0])
     nnx.update((dit_model, optimizer), state)
-    # print()
-
-    import streaming
 
     streaming.base.util.clean_stale_shared_memory()
     dataset = StreamingDataset(
         local=local_train_dir,
         remote=remote_train_dir,
         split=None,
-        # shuffle=True,
-        shuffle_algo="naive",
         batch_size=config.batch_size,
     )
 
     train_loader = DataLoader(
         dataset[: config.data_split],
-        batch_size=batch_size,  # config.batch_size,
+        batch_size=batch_size,
         num_workers=0,
         drop_last=True,
         collate_fn=jax_collate,
-        # sampler=dataset_sampler, # thi sis for multiprocess/v4-32
     )
-    sp = next(iter(train_loader))
 
+    sp = next(iter(train_loader))
     print(f"loaded data \n data sample: {sp['vae_output'].shape}")
 
-    if run == "overfit":
-        model, loss = batch_trainer(
-            epochs, model=dit_model, optimizer=optimizer, train_loader=train_loader
-        )
+    if run == "single_batch":
+        model, loss = batch_trainer(epochs, model=dit_model, optimizer=optimizer, train_loader=train_loader)
         wandb.finish()
         print(f"single batch training ended at loss: {loss:.4f}")
-
+        
     elif run == "train":
         print(f"you missed your train looop impl boy")
-        # trainer(epochs)
-        # wandb.finish()
-        # print("microdit (test) training (on imagenet-1k) in JAX..done")
-
 
 main()
