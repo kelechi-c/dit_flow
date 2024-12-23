@@ -6,25 +6,32 @@ from Meta's 1D-data pytorch implementation @ https://github.com/facebookresearch
 import jax
 from jax import Array, numpy as jnp, random as jrand
 from tqdm import tqdm
+from flax import nnx
 
 randkey = jrand.key(333) # set seed/key for array creation
 
 @jax.jit
-def flow_lossfn(model, batch):
-    x_1, c = batch['vae_output'], batch['labels'] # data, image latent/label pairs
-    x_0 = jrand.normal(randkey, x_1.shape)
-    t = jrand.normal(randkey, len(x_1))
+def flow_lossfn(model, batch): # flow matching loss for diffusion/images(DiTs specifically)
+    x_1, c = batch # data, image latent/label pairs
+    bs = x_1.shape[0]
 
-    x_t = (1-t) * x_0 + t * x_1 # noised input
-    dx_t = x_1 - x_0 # actual vector/velocity difference 
+    x_0 = jrand.normal(randkey, x_1.shape)  # noise
+    t = jrand.uniform(randkey, (bs,))
+    t = nnx.sigmoid(t)
 
-    vtheta = model(x_t, t, c) # model prediction ('neural velocity field' from the paper)
+    inshape = [1] * len(x_1.shape[1:]) # shape of array excluding batch axis
+    t_exp = t.reshape([bs, *(inshape)]) 
+
+    x_t = (1 - t_exp) * x_0 + t_exp * x_1 # add noise
+    dx_t = x_1 - x_0  # actual vector/velocity difference
+
+    vtheta = model(x_t, c, t)  # model/vector field prediction
 
     mean_dim = list(range(1, len(x_1.shape)))  # across all dimensions except the batch dim
     mean_square = (dx_t - vtheta) ** 2  # squared difference/error
     batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
-    loss = jnp.mean(batchwise_mse_loss)
-
+    loss = jnp.mean(batchwise_mse_loss) # average again
+    
     return loss
 
 
@@ -39,17 +46,14 @@ def flow_step(self, x_t: Array, cond: Array, t_start: float, t_end: float) -> Ar
     x_t_next = x_t + (t_end - t_start) * v_mid
     return x_t_next
 
+# Generates samples using flow matching
+def sample(self, label: Array, num_steps: int = 50):
+    time_steps = jnp.linspace(0.0, 1.0, num_steps + 1)
+    x_t = jax.random.normal(randkey, (len(label), 32, 32, 4))  # important change
 
-def sample(model, x_t: Array, cond: Array, num_steps: int = 50):
-    time_steps = jnp.linspace(0, 1.0, num_steps + 1)
-
-    for k in tqdm(range(num_steps)):
-        x_t = flow_step(
-            model,
-            x_t = x_t,
-            cond=cond, 
-            t_start = time_steps[k], 
-            t_end = time_steps[k + 1]
+    for k in tqdm(range(num_steps), desc="Sampling images(hopefully...)"):
+        x_t = self.flow_step(
+            x_t=x_t, cond=label, t_start=time_steps[k], t_end=time_steps[k + 1]
         )
 
-    return x_t
+    return x_t / 0.13025
