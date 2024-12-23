@@ -1,8 +1,13 @@
 ## dit_flow
 **Training a diffusion transformer with flow matching**
 
-This is a **minimal** example of using **flow matching** for **diffusion model(DiT) training**, 
-and it's also implemented in **JAX** (might add a pytorch version if needed).
+This is a **minimal** example of **diffusion model(DiT) training** with **flow matching**, 
+implemented in **JAX/Flax**.
+
+##### sample
+
+<img src="assets/step_450_singlebatch.png" alt="drawing" width="250"/> \
+*450 steps, single batch training, Imagenet, 350M param DiT*
 
 ##### credits
 * [**Flow Matching Guide and Code**](https://arxiv.org/abs/2412.06264) => research paper.
