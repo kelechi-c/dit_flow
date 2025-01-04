@@ -499,7 +499,6 @@ def train_step(model, optimizer, batch):
 
         inshape = [1] * len(x_1.shape[1:])
         t_exp = t.reshape([bs, *(inshape)])
-        # print(f'{x_1.shape = } / {c.shape = } / {t.shape = }')
 
         x_t = (1 - t_exp) * x_0 + t_exp * x_1
         dx_t = x_1 - x_0  # actual vector/velocity difference
@@ -519,7 +518,7 @@ def train_step(model, optimizer, batch):
     return loss
 
 
-def batch_trainer(epochs, model, optimizer, train_loader):
+def trainer(epochs, model, optimizer, train_loader):
     train_loss = 0.0
     model.train()
 
@@ -527,18 +526,17 @@ def batch_trainer(epochs, model, optimizer, train_loader):
 
     stime = time.time()
 
-    batch = next(iter(train_loader))
-    print("start overfitting.../")
+    print("start training.../")
 
     for epoch in tqdm(range(epochs)):
-        train_loss = train_step(model, optimizer, batch)
-        print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
-        wandb.log({"loss": train_loss, "log_loss": math.log10(train_loss)})
+        for step, batch in tqdm(enumerate(train_loader)):
+            train_loss = train_step(model, optimizer, batch)
+            print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
+            wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss)})
 
-        if epoch % 50 == 0:
-            gridfile = sample_image_batch(epoch, model, batch["label"])
-            image_log = wandb.Image(gridfile)
-            wandb.log({"image_sample": image_log})
+        gridfile = sample_image_batch(epoch, model, batch["label"])
+        image_log = wandb.Image(gridfile)
+        wandb.log({"image_sample": image_log})
 
         jax.clear_caches()
         jax.clear_backends()
@@ -546,15 +544,13 @@ def batch_trainer(epochs, model, optimizer, train_loader):
 
     etime = time.time() - stime
     print(
-        f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
+        f"train time for {epochs} epochs -> {etime/60/60:.4f} hrs"
     )
 
-    epoch_file = sample_image_batch("overfit", model, batch["label"])
+    epoch_file = sample_image_batch(f"train_{len(train_loader)*epochs}", model, batch["label"])
+    
     epoch_image_log = wandb.Image(epoch_file)
-    wandb.log({"overfit_sample": epoch_image_log})
-
-    return model, train_loss
-
+    wandb.log({"train_sample": epoch_image_log})
 
 @click.command()
 @click.option("-r", "--run", default="single_batch")
@@ -593,11 +589,10 @@ def main(run, epochs, batch_size):
     print(f"loaded data \n data sample: {sp['vae_output'].shape}")
 
     if run == "single_batch":
-        model, loss = batch_trainer(epochs, model=dit_model, optimizer=optimizer, train_loader=train_loader)
-        wandb.finish()
-        print(f"single batch training ended at loss: {loss:.4f}")
+        print(f"Be a man and do a full training run")
         
     elif run == "train":
-        print(f"you missed your train looop impl boy")
+        model, loss = trainer(epochs, dit_model, optimizer, train_loader)
+        print(f"final train loss: {loss:.4f}")
 
 main()
