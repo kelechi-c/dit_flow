@@ -2,9 +2,10 @@ import jax, optax, wandb, torch, os, click, math, gc, time
 import numpy as np
 from flax import nnx
 from jax import Array, numpy as jnp, random as jrand
-from jax.sharding import NamedSharding, Mesh, PartitionSpec as PS
+from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
 from jax import random as jrand
+from flax.training import train_state
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 import streaming
@@ -18,6 +19,7 @@ from typing import Any
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import warnings
+from functools import partial
 warnings.filterwarnings("ignore")
 
 
@@ -50,8 +52,9 @@ for device in devices:
     print(f"{device} / ")
 
 mesh_devices = mesh_utils.create_device_mesh((num_devices,))
-mesh = Mesh(mesh_devices, axis_names="axis")
-sharding = NamedSharding(mesh, PS("axis"))
+mesh = Mesh(mesh_devices, axis_names=("data",))
+data_sharding = NS(mesh, PS("data"))
+rep_sharding = NS(mesh, PS())
 
 # sd VAE for decoding latents
 vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
@@ -480,10 +483,43 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
     return file
 
 
-@nnx.jit
-def train_step(model, optimizer, batch):
-    def flow_lossfn(model, batch):  # loss function for flow matching
-        img_latents, labels = batch["vae_output"], batch["label"]
+def _to_jax_array(x):
+    if not isinstance(x, jax.Array):
+        x = jnp.asarray(x)
+    return x
+
+class TrainState(train_state.TrainState):
+    graphdef: nnx.GraphDef[DiT]
+
+
+def initialize_state(model: nnx.Module, mesh, optimizer):
+    with mesh:
+        graphdef, params = nnx.split(model, nnx.Param)
+        state = TrainState.create(
+            apply_fn=graphdef.apply, params=params, tx=optimizer, graphdef=graphdef
+        )
+        state = jax.tree.map(_to_jax_array, state)
+        state_spec = nnx.get_partition_spec(state)
+        state = jax.lax.with_sharding_constraint(state, state_spec)
+
+    state_sharding = nnx.get_named_sharding(state, mesh)
+    return state, state_sharding
+
+dit_model = DiT(dim=1024, depth=24, attn_heads=16)
+
+tx_optimizer = optax.adamw(learning_rate=3e-4)
+state, state_sharding = initialize_state(dit_model, mesh, tx_optimizer)
+
+
+@partial(
+    jax.jit,
+    in_shardings=(state_sharding, data_sharding, data_sharding),  # type: ignore
+    out_shardings=(state_sharding, None, None),  # type: ignore
+    donate_argnums=0,
+)
+def train_step(model_state, image, labels):
+    def flow_lossfn(model_state, image, label):  # loss function for flow matching
+        # img_latents, labels = batch["vae_output"], batch["label"]
 
         img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
         img_latents = rearrange(img_latents, "b c h w -> b h w c") # jax uses channels-last format
@@ -512,8 +548,13 @@ def train_step(model, optimizer, batch):
 
         return loss
 
-    loss, grads = nnx.value_and_grad(flow_lossfn)(model, batch)
-    optimizer.update(grads)
+    # loss, grads = nnx.value_and_grad(flow_lossfn)(model, batch)
+    # optimizer.update(grads)
+    
+    grad_fn = jax.value_and_grad(flow_lossfn, has_aux=True)
+    (loss, logits), grads = grad_fn(model_state.params, batch)
+    new_state = model_state.apply_gradients(grads=grads)
+    grad_norm = optax.global_norm(grads)
 
     return loss
 
@@ -530,7 +571,8 @@ def trainer(epochs, model, optimizer, train_loader):
 
     for epoch in tqdm(range(epochs)):
         for step, batch in tqdm(enumerate(train_loader)):
-            train_loss = train_step(model, optimizer, batch)
+            images, labels = batch['vae_output'], batch['labels']
+            train_loss = train_step(model, images, labels)
             print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
             wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss)})
 
@@ -558,16 +600,15 @@ def trainer(epochs, model, optimizer, train_loader):
 @click.option("-bs", "--batch_size", default=config.batch_size)
 def main(run, epochs, batch_size):
     # DiT-B config
-    dit_model = DiT(dim=1024, depth=24, attn_heads=16)
 
     n_params = sum([p.size for p in jax.tree.leaves(nnx.state(dit_model))])
     print(f"model parameters count: {n_params/1e6:.2f}M, ")
 
-    optimizer = nnx.Optimizer(dit_model, optax.adamw(learning_rate=config.lr))
+    # # optimizer = nnx.Optimizer(dit_model, optax.adamw(learning_rate=config.lr))
 
-    state = nnx.state((dit_model, optimizer))
-    state = jax.device_put(state, jax.devices()[0])
-    nnx.update((dit_model, optimizer), state)
+    # state = nnx.state((dit_model, optimizer))
+    # state = jax.device_put(state, jax.devices()[0])
+    # nnx.update((dit_model, optimizer), state)
 
     streaming.base.util.clean_stale_shared_memory()
     dataset = StreamingDataset(
@@ -592,7 +633,7 @@ def main(run, epochs, batch_size):
         print(f"Be a man and do a full training run")
         
     elif run == "train":
-        model, loss = trainer(epochs, dit_model, optimizer, train_loader)
+        model, loss = trainer(epochs, dit_model, state, train_loader)
         print(f"final train loss: {loss:.4f}")
 
 main()
